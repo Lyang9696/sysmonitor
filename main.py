@@ -227,9 +227,11 @@ def main():
         overlay.update_snapshot(snap)
         window.update_snapshot(snap)
         window.update_history(collector)
-        # 兜底:悬浮窗被"显示桌面"等操作隐藏后自动恢复(设置开启时)
-        if cfg.get("show_overlay", True) and not overlay.isVisible():
-            overlay.show()
+        # 悬浮窗保活:被"显示桌面"隐藏后自动恢复;停靠在任务栏上时,
+        # 点击任务栏会被 Explorer 提到悬浮窗之前,每秒提升一次层级压回去
+        if cfg.get("show_overlay", True):
+            if not overlay.isVisible():
+                overlay.show()
             overlay.raise_()
 
     def apply_settings(new_cfg):
