@@ -60,6 +60,8 @@ def r_str(r):
 _WIN32 = sys.platform == "win32"
 if _WIN32:
     _WM_GETMINMAXINFO = 0x0024
+    _HWND_TOPMOST, _HWND_BOTTOM = -1, 1
+    _SWP_KEEP = 0x0013  # SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
     _user32 = ctypes.windll.user32
     _user32.GetForegroundWindow.restype = wintypes.HWND  # 默认 c_int 会截断 64 位句柄
 
@@ -134,6 +136,13 @@ class OverlayWindow(QWidget):
         self._morph_anim.valueChanged.connect(self._set_morph)
         self._morph_anim.finished.connect(self._morph_done)
         self._morph_data = None  # (起始度量, 目标度量):形变动画期间非 None
+
+        # ---- 截图层监听:截图/录屏全屏层激活时沉到其下,结束恢复置顶 ----
+        self._buried = False  # 当前已压到 Z 序最底
+        self._z_timer = QTimer(self)
+        self._z_timer.setInterval(400)
+        self._z_timer.timeout.connect(self._check_capture_layer)
+        self._z_timer.start()
 
         # ---- 界面:四环网格 + 信息行 ----
         self.rings = {}
@@ -509,6 +518,19 @@ class OverlayWindow(QWidget):
         return (rc.left / dpr <= g.left() + 2 and rc.top / dpr <= g.top() + 2
                 and rc.right / dpr >= g.right() - 2 and rc.bottom / dpr >= g.bottom() - 2)
 
+    def _check_capture_layer(self):
+        """截图/录屏全屏层激活时把悬浮窗压到 Z 序最底(沉到截图图层之下),
+        结束后恢复置顶——置顶悬浮窗否则会一直浮在截图编辑层上方。"""
+        if not self.isVisible():
+            return
+        if self._screenshot_overlay_active():
+            if not self._buried:
+                self._buried = True
+                _user32.SetWindowPos(int(self.winId()), _HWND_BOTTOM, 0, 0, 0, 0, _SWP_KEEP)
+        elif self._buried:
+            self._buried = False
+            _user32.SetWindowPos(int(self.winId()), _HWND_TOPMOST, 0, 0, 0, 0, _SWP_KEEP)
+
     def _enter_expand(self):
         if (self.underMouse() and self.dock_edge and self._dock_state == "compact"
                 and not self._screenshot_overlay_active()):
@@ -645,6 +667,8 @@ class OverlayWindow(QWidget):
 
     def contextMenuEvent(self, e):
         menu = QMenu(self)
+        # 悬浮窗本身置顶,弹出菜单不显式置顶的话会被盖在窗口下面
+        menu.setWindowFlags(menu.windowFlags() | Qt.WindowStaysOnTopHint)
         menu.addAction("打开主窗口", self.open_main.emit)
         lay_menu = menu.addMenu("布局")
         for mode, label in (("grid2", "2x2 网格"), ("row4", "横排 4x1"), ("col4", "竖排 1x4")):
