@@ -60,7 +60,7 @@ def r_str(r):
 _WIN32 = sys.platform == "win32"
 if _WIN32:
     _WM_GETMINMAXINFO = 0x0024
-    _HWND_TOPMOST, _HWND_BOTTOM = -1, 1
+    _HWND_BOTTOM = 1
     _SWP_KEEP = 0x0013  # SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
     _user32 = ctypes.windll.user32
     _user32.GetForegroundWindow.restype = wintypes.HWND  # 默认 c_int 会截断 64 位句柄
@@ -91,6 +91,7 @@ class OverlayWindow(QWidget):
         self.setWindowTitle("系统监控")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)  # 截图层结束重建窗口恢复置顶时不抢焦点
 
         # ---- 状态 ----
         self.mode = "grid2"       # 自由态布局:grid2 / row4 / col4
@@ -139,6 +140,7 @@ class OverlayWindow(QWidget):
 
         # ---- 截图层监听:截图/录屏全屏层激活时沉到其下,结束恢复置顶 ----
         self._buried = False  # 当前已压到 Z 序最底
+        self._bury_votes = 0  # 连续命中计数:连续 2 次才沉底,防窗口切换的瞬时误判
         self._z_timer = QTimer(self)
         self._z_timer.setInterval(400)
         self._z_timer.timeout.connect(self._check_capture_layer)
@@ -493,10 +495,9 @@ class OverlayWindow(QWidget):
     def _clear_skip(self):
         self._skip_enter = False
 
-    def _screenshot_overlay_active(self, topmost_only=False):
-        """截图/录屏类全屏前台层是否激活。topmost_only=True 时只认带 WS_EX_TOPMOST
-        的全屏层(截图/录屏类要盖住任务栏必为置顶);普通最大化/全屏应用永远不是
-        置顶窗口,绝不误判——否则悬浮窗会被压到浏览器/文件夹底下起不来。"""
+    def _screenshot_overlay_active(self):
+        """截图/录屏类全屏前台层是否激活:此时悬停展开会画在截图图层之外,应抑制。
+        判定:非本进程的外来窗口全屏覆盖所在屏幕(排除桌面/任务栏外壳)。"""
         if not _WIN32:
             return False
         fg = _user32.GetForegroundWindow()
@@ -510,8 +511,6 @@ class OverlayWindow(QWidget):
         _user32.GetClassNameW(fg, name, 64)
         if name.value in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
             return False
-        if topmost_only and not (_user32.GetWindowLongW(fg, -20) & 0x8):  # WS_EX_TOPMOST
-            return False
         rc = wintypes.RECT()
         if not _user32.GetWindowRect(fg, ctypes.byref(rc)):
             return False
@@ -521,19 +520,60 @@ class OverlayWindow(QWidget):
         return (rc.left / dpr <= g.left() + 2 and rc.top / dpr <= g.top() + 2
                 and rc.right / dpr >= g.right() - 2 and rc.bottom / dpr >= g.bottom() - 2)
 
+    def _fullscreen_layer_active(self):
+        """悬浮窗之下的真·全屏层(截图/录屏编辑层):非置顶、非最大化的外来全屏前台窗口。
+        排除两类误伤(均经实机验证):
+        - WS_EX_TOPMOST 的壳宿主(Win11 切窗口瞬间 XamlExplorerHostIslandWindow 为前台,
+          天生置顶+全屏矩形,曾导致每次切软件悬浮窗都沉底)
+        - IsZoomed 的最大化应用(自动隐藏任务栏时矩形含 8px 隐形边框同样覆盖全屏)"""
+        if not _WIN32:
+            return False
+        fg = _user32.GetForegroundWindow()
+        if not fg:
+            return False
+        pid = wintypes.DWORD()
+        _user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+        if pid.value == os.getpid():
+            return False
+        name = ctypes.create_unicode_buffer(64)
+        _user32.GetClassNameW(fg, name, 64)
+        if name.value in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+            return False
+        if _user32.GetWindowLongW(fg, -20) & 0x8:  # WS_EX_TOPMOST
+            return False
+        if _user32.IsZoomed(fg):
+            return False
+        rc = wintypes.RECT()
+        if not _user32.GetWindowRect(fg, ctypes.byref(rc)):
+            return False
+        scr = self._screen()
+        dpr = scr.devicePixelRatio() or 1.0
+        g = scr.geometry()
+        return (rc.left / dpr <= g.left() + 2 and rc.top / dpr <= g.top() + 2
+                and rc.right / dpr >= g.right() - 2 and rc.bottom / dpr >= g.bottom() - 2)
+
     def _check_capture_layer(self):
-        """截图/录屏全屏置顶层激活时把悬浮窗压到 Z 序最底(沉到截图图层之下),
-        结束后恢复置顶。触发条件必须含 WS_EX_TOPMOST(见 _screenshot_overlay_active),
-        否则普通最大化窗口的前台状态会把悬浮窗永远压在所有软件下面。"""
+        """真·全屏层(截图/录屏编辑层,非置顶非最大化)激活时把悬浮窗压到 Z 序最底
+        (沉到截图图层之下),结束后恢复置顶。连续 2 个节拍命中才沉底,恢复则立即。
+        恢复必须走 Qt 标志重建:HWND_BOTTOM 除名后原生 HWND_TOPMOST 永远失败
+        (实测 ret=0),只有 False→show→True→show 能把 WS_EX_TOPMOST 加回来。"""
         if not self.isVisible():
             return
-        if self._screenshot_overlay_active(topmost_only=True):
-            if not self._buried:
+        if self._fullscreen_layer_active():
+            self._bury_votes += 1
+            if not self._buried and self._bury_votes >= 2:
                 self._buried = True
+                dlog("capture layer on: bury to bottom")
                 _user32.SetWindowPos(int(self.winId()), _HWND_BOTTOM, 0, 0, 0, 0, _SWP_KEEP)
-        elif self._buried:
-            self._buried = False
-            _user32.SetWindowPos(int(self.winId()), _HWND_TOPMOST, 0, 0, 0, 0, _SWP_KEEP)
+        elif self._bury_votes or self._buried:
+            self._bury_votes = 0
+            if self._buried:
+                self._buried = False
+                dlog("capture layer off: restore topmost")
+                self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+                self.show()
+                self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+                self.show()
 
     def _enter_expand(self):
         if (self.underMouse() and self.dock_edge and self._dock_state == "compact"
