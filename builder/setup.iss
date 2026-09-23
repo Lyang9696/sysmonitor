@@ -27,4 +27,4 @@ Name: "{group}\卸载 系统监控"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\系统监控"; Filename: "{app}\sysmonitor.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\sysmonitor.exe"; Description: "立即运行 系统监控"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\sysmonitor.exe"; Description: "立即运行 系统监控"; Flags: nowait postinstall skipifsilent runascurrentuser
