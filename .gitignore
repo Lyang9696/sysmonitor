@@ -28,7 +28,6 @@ app_log.txt
 build_log.txt
 gh_path.txt
 user.json
-rebuild_admin.bat
 diag_admin.bat
 diag_mem.py
 
