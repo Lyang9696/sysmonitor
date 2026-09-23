@@ -1,4 +1,4 @@
-"""圆环仪表(手机电量风格,阈值变色)与折线小图。"""
+"""圆环仪表(手机电量风格,阈值变色;停靠收缩态环心带硬件线稿小图标)与折线小图。"""
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QApplication, QWidget
@@ -79,12 +79,56 @@ class RingWidget(QWidget):
         self.warn, self.danger = warn, danger
         self.update()
 
+    def _draw_device_icon(self, p, c, cx, cy, s):
+        """收缩小环中心的硬件线稿图标(极简线条风,对应 CPU/GPU/MEM/DISK)。s=外接边长。"""
+        pen = QPen(c["dim"], max(1.0, s * 0.10), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        h = s / 2
+        kind = self.label.upper()
+
+        if kind == "CPU":  # 芯片:方身 + 中心核 + 四边引脚
+            b = h * 0.62
+            p.drawRoundedRect(QRectF(cx - b, cy - b, b * 2, b * 2), b * 0.3, b * 0.3)
+            p.drawEllipse(QPointF(cx, cy), b * 0.36, b * 0.36)
+            for t in (-b * 0.42, b * 0.42):
+                p.drawLine(QPointF(cx + t, cy - b), QPointF(cx + t, cy - h))
+                p.drawLine(QPointF(cx + t, cy + b), QPointF(cx + t, cy + h))
+                p.drawLine(QPointF(cx - b, cy + t), QPointF(cx - h, cy + t))
+                p.drawLine(QPointF(cx + b, cy + t), QPointF(cx + h, cy + t))
+
+        elif kind == "GPU":  # 显卡:卡身 + 风扇 + 尾部散热孔
+            p.drawRoundedRect(QRectF(cx - h, cy - h * 0.52, s, h * 1.04), s * 0.1, s * 0.1)
+            fx = cx - h * 0.3
+            p.drawEllipse(QPointF(fx, cy), h * 0.32, h * 0.32)
+            p.drawEllipse(QPointF(fx, cy), h * 0.08, h * 0.08)
+            for vx in (cx + h * 0.42, cx + h * 0.62):
+                p.drawLine(QPointF(vx, cy - h * 0.26), QPointF(vx, cy + h * 0.26))
+
+        elif kind == "MEM":  # 内存:竖条 + 两颗颗粒 + 底部金手指
+            w2, bh = h * 0.36, h * 0.76
+            p.drawRoundedRect(QRectF(cx - w2, cy - bh, w2 * 2, bh * 2), w2 * 0.4, w2 * 0.4)
+            for yy in (cy - bh * 0.42, cy + bh * 0.12):
+                p.drawRect(QRectF(cx - w2 * 0.55, yy, w2 * 1.1, bh * 0.36))
+            for i in range(3):
+                xx = cx - w2 * 0.5 + i * w2 * 0.5
+                p.drawLine(QPointF(xx, cy + bh), QPointF(xx, cy + h))
+
+        else:  # DISK 硬盘:方身 + 盘片 + 主轴 + 摇臂
+            p.drawRoundedRect(QRectF(cx - h, cy - h * 0.8, s, h * 1.6), s * 0.12, s * 0.12)
+            px, py = cx - h * 0.18, cy + h * 0.06
+            p.drawEllipse(QPointF(px, py), h * 0.38, h * 0.38)
+            p.setBrush(pen.color())
+            p.drawEllipse(QPointF(px, py), h * 0.09, h * 0.09)
+            p.setBrush(Qt.NoBrush)
+            p.drawLine(QPointF(cx + h * 0.55, cy - h * 0.5), QPointF(px + h * 0.26, py - h * 0.2))
+
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         c = pal()
 
-        if self.compact:  # 停靠态:只画一个占满单元的小环
+        if self.compact:  # 停靠态:占满单元的小环 + 环心硬件小图标
             w = min(self.width(), self.height())
             pen_w = max(3.0, w * 0.16)
             d = w - pen_w - 3
@@ -96,6 +140,7 @@ class RingWidget(QWidget):
                 pen.setColor(level_color(self.value, self.warn, self.danger))
                 p.setPen(pen)
                 p.drawArc(rect, 90 * 16, -int(self.value * 3.6) * 16)
+            self._draw_device_icon(p, c, rect.center().x(), rect.center().y(), d * 0.62)
             p.end()
             return
 

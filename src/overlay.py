@@ -1,6 +1,6 @@
 """桌面悬浮窗:无边框、置顶、可拖动、四边吸附停靠;2x2 / 4x1 / 1x4 布局。
 
-窗口有三种形态(全程几何动画过渡):
+窗口有三种形态(几何与内容同步形变过渡):
   自由 free     -- 跟随鼠标拖动,完整面板
   停靠 compact  -- 松手时贴近屏幕边缘(≤20px)触发:收缩为贴边小环
   停靠 full     -- 光标在收缩小环上悬停 120ms 展开;移开 600ms 后收回小环
@@ -14,6 +14,7 @@ dlog() 把每次吸附/展开/收缩的目标与实际几何写入 dock_debug.lo
 排查多屏/缩放环境下的错位时打开看。
 """
 import ctypes
+import os
 import sys
 import time
 from ctypes import wintypes
@@ -21,10 +22,10 @@ from pathlib import Path
 
 from PySide6.QtCore import (QEasingCurve, QEvent, QPoint, QPointF,
                             QPropertyAnimation, QRect, QRectF, Qt,
-                            QTimer, Signal)
+                            QTimer, QVariantAnimation, Signal)
 from PySide6.QtGui import QCursor, QGuiApplication, QPainter
-from PySide6.QtWidgets import (QGridLayout, QLabel, QLayout, QMenu,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QGraphicsOpacityEffect, QGridLayout, QLabel,
+                               QLayout, QMenu, QVBoxLayout, QWidget)
 
 from widgets import RingWidget, pal
 
@@ -33,6 +34,8 @@ COMPACT = 26             # 停靠收缩态环尺寸
 EDGE_SNAP = 20           # 松手时窗口边缘距屏幕边缘 ≤ 该距离则吸附(px)
 DOCK_GAP = 4             # 停靠时距屏幕边缘
 SHRINK_DELAY = 600       # 悬停展开后鼠标离开→收起的延时(ms)
+EXPAND_MS = 220          # 悬停展开形变时长:要"长出来"的缓冲感
+SHRINK_MS = 140          # 收回形变时长:要干脆
 MODES = ("grid2", "row4", "col4")
 
 
@@ -57,6 +60,8 @@ def r_str(r):
 _WIN32 = sys.platform == "win32"
 if _WIN32:
     _WM_GETMINMAXINFO = 0x0024
+    _user32 = ctypes.windll.user32
+    _user32.GetForegroundWindow.restype = wintypes.HWND  # 默认 c_int 会截断 64 位句柄
 
     class _POINT(ctypes.Structure):
         _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
@@ -89,6 +94,7 @@ class OverlayWindow(QWidget):
         self.mode = "grid2"       # 自由态布局:grid2 / row4 / col4
         self.dock_edge = None     # 停靠边:None(自由) / top / bottom / left / right
         self._dock_state = None   # 停靠形态:None(自由) / "full"(贴边完整) / "compact"(收缩小环)
+        self._dock_anchor = None  # 停靠锚点:full/compact 往复形变共用,防逐周期漂移
         self.temp_mode = False    # 温度显示模式:环显示温度而非百分比
 
         # ---- 拖动 ----
@@ -120,6 +126,14 @@ class OverlayWindow(QWidget):
         self._shrink_timer.setSingleShot(True)
         self._shrink_timer.setInterval(SHRINK_DELAY)
         self._shrink_timer.timeout.connect(self._auto_shrink)
+        # 形变进度动画:与 _anim 同曲线同时长,驱动内容(环/网格/信息行)逐帧插值
+        self._morph_anim = QVariantAnimation(self)
+        self._morph_anim.setStartValue(0.0)  # 不设起止值 valueChanged 永不触发,内容不会跟着形变
+        self._morph_anim.setEndValue(1.0)
+        self._morph_anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._morph_anim.valueChanged.connect(self._set_morph)
+        self._morph_anim.finished.connect(self._morph_done)
+        self._morph_data = None  # (起始度量, 目标度量):形变动画期间非 None
 
         # ---- 界面:四环网格 + 信息行 ----
         self.rings = {}
@@ -136,6 +150,8 @@ class OverlayWindow(QWidget):
         self.info_label = QLabel("↑ 0 KB/s   ↓ 0 KB/s\n读 0 MB/s   写 0 MB/s")
         self.info_label.setAlignment(Qt.AlignCenter)
         self.info_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._label_fx = QGraphicsOpacityEffect(self.info_label)  # 形变时信息行淡入淡出
+        self.info_label.setGraphicsEffect(self._label_fx)
 
         self.vlay = QVBoxLayout(self)
         self.vlay.setSizeConstraint(QLayout.SetNoConstraint)  # 布局不得干预窗口最小尺寸:
@@ -173,9 +189,11 @@ class OverlayWindow(QWidget):
         self._dock_state = "compact"
         self._apply_layout()
         self._snap_to_edge(edge)
+        self._dock_anchor = self.frameGeometry().center()
 
     def _apply_layout(self):
         """按 (dock_edge, _dock_state, mode) 应用内部布局(尺寸/显隐/文本)。"""
+        self._morph_abort()  # 布局兜底重排时终止进行中的形变并落定终态
         while self.grid.count():
             self.grid.takeAt(0)
         edge = self.dock_edge
@@ -344,16 +362,70 @@ class OverlayWindow(QWidget):
             y = av.top() + DOCK_GAP
         return QRect(x, y, w, h)
 
-    def _morph_to(self, state):
-        """在 full/compact 停靠形态间平滑过渡(几何动画)。"""
-        anchor = self.frameGeometry().center()
-        scr = self._screen()
-        self._dock_state = state
-        self._apply_layout()  # 尺寸与信息行文本先就位,矩形按新形态计算
-        rect = self._dock_rect(self.dock_edge, state, anchor, scr)
-        self._animate_to(rect)
+    def _morph_abort(self):
+        """中断形变:stop() 不触发 finished(PySide6/Qt6 实测),须手动落定终态。"""
+        if self._morph_data is None:
+            return
+        self._morph_anim.stop()
+        self._morph_done()
 
-    def _animate_to(self, rect):
+    def _morph_to(self, state):
+        """在 full/compact 停靠形态间形变过渡:窗口矩形走 _anim,环尺寸/网格/
+        信息行高度与透明度由 _morph_anim 按同一进度插值——内容不再先一步跳到终态。"""
+        if not self.dock_edge or self._dock_state == state:
+            return
+        anchor = self._dock_anchor or self.frameGeometry().center()
+        scr = self._screen()
+        if state == "full" and getattr(self, "_snap", None) is None:
+            # 无数据先按目标形状摆占位文本, sizeHint/目标矩形才算得准(与 _apply_layout 一致)
+            vertical = self.dock_edge in ("left", "right")
+            self.info_label.setText("↑ 0 KB/s\n↓ 0 KB/s\n读 0 MB/s\n写 0 MB/s" if vertical
+                                    else "↑ 0 KB/s   ↓ 0 KB/s   读 0 MB/s   写 0 MB/s")
+        self._morph_data = (self._dock_metrics(self.dock_edge, self._dock_state),
+                            self._dock_metrics(self.dock_edge, state))
+        self._dock_state = state
+        rect = self._dock_rect(self.dock_edge, state, anchor, scr)
+        d = EXPAND_MS if state == "full" else SHRINK_MS
+        self._morph_anim.setDuration(d)  # 与 _anim 同长同曲线,两条动画才逐帧同步
+        self._animate_to(rect, d)
+        self._morph_anim.start()
+
+    def _dock_metrics(self, edge, state):
+        """停靠形态的内容度量 (环宽, 环高, 网格宽, 网格高, 信息行高),供形态间插值。"""
+        sp = 2
+        horizontal = edge in ("top", "bottom")
+        if state == "compact":
+            gw = 4 * COMPACT + 3 * sp if horizontal else COMPACT
+            gh = COMPACT if horizontal else 4 * COMPACT + 3 * sp
+            return COMPACT, COMPACT, gw, gh, 0
+        gw = 4 * RING + 3 * sp if horizontal else RING
+        gh = RING_H if horizontal else 4 * RING_H + 3 * sp
+        return RING, RING_H, gw, gh, self.info_label.sizeHint().height()
+
+    def _set_morph(self, p):
+        """形变逐帧插值:p=0 compact,p=1 full。窗口矩形由 _anim 驱动,这里只管内容。"""
+        if self._morph_data is None:
+            return
+        m0, m1 = self._morph_data
+        v = [a + (b - a) * p for a, b in zip(m0, m1)]
+        # 两套画法在中点切换:p 恒为 0→1,向哪个终态靠拢由 m1 决定(m1[4]=0 即收起)
+        compact = (p < 0.5) if m1[4] else (p >= 0.5)
+        for ring in self.rings.values():
+            ring.set_compact(compact)
+            ring.setFixedSize(round(v[0]), round(v[1]))
+        self._grid_host.setFixedSize(round(v[2]), round(v[3]))
+        self.info_label.setVisible(True)  # 收起时淡出到 0,落位后由 _morph_done 隐藏
+        self.info_label.setMaximumHeight(round(v[4]))
+        if max(m0[4], m1[4]):
+            self._label_fx.setOpacity(min(1.0, v[4] / max(m0[4], m1[4])))
+
+    def _morph_done(self):
+        self._morph_data = None
+        self.info_label.setMaximumHeight(16777215)
+        self.info_label.setVisible(self._dock_state == "full")
+        self._label_fx.setOpacity(1.0)
+
+    def _animate_to(self, rect, ms=180):
         self.setMinimumSize(0, 0)
         self.setMaximumSize(16777215, 16777215)
         self._target_rect = QRect(rect)
@@ -363,6 +435,7 @@ class OverlayWindow(QWidget):
         self._lock_ok = False
         self._anim.stop()
         self._lock_ok = True
+        self._anim.setDuration(ms)
         self._anim.setStartValue(self.geometry())
         self._anim.setEndValue(rect)
         self._anim.start()
@@ -411,8 +484,34 @@ class OverlayWindow(QWidget):
     def _clear_skip(self):
         self._skip_enter = False
 
+    def _screenshot_overlay_active(self):
+        """截图/录屏类全屏前台层是否激活:此时悬停展开会画在截图图层之外,应抑制。
+        判定:非本进程的外来窗口全屏覆盖所在屏幕(排除桌面/任务栏外壳)。"""
+        if not _WIN32:
+            return False
+        fg = _user32.GetForegroundWindow()
+        if not fg:
+            return False
+        pid = wintypes.DWORD()
+        _user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+        if pid.value == os.getpid():
+            return False
+        name = ctypes.create_unicode_buffer(64)
+        _user32.GetClassNameW(fg, name, 64)
+        if name.value in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+            return False
+        rc = wintypes.RECT()
+        if not _user32.GetWindowRect(fg, ctypes.byref(rc)):
+            return False
+        scr = self._screen()
+        dpr = scr.devicePixelRatio() or 1.0  # GetWindowRect 是物理像素,除以 dpr 再比逻辑坐标
+        g = scr.geometry()
+        return (rc.left / dpr <= g.left() + 2 and rc.top / dpr <= g.top() + 2
+                and rc.right / dpr >= g.right() - 2 and rc.bottom / dpr >= g.bottom() - 2)
+
     def _enter_expand(self):
-        if self.underMouse() and self.dock_edge and self._dock_state == "compact":
+        if (self.underMouse() and self.dock_edge and self._dock_state == "compact"
+                and not self._screenshot_overlay_active()):
             self._morph_to("full")
 
     def enterEvent(self, _):
@@ -456,6 +555,11 @@ class OverlayWindow(QWidget):
             self._lock_ok = False
             self._anim.stop()  # 动画与拖动互斥
             self._lock_ok = True
+            if self._morph_data is not None:  # 点按打断形变:直接落到目标形态,别冻在半路
+                self._morph_abort()
+                if self._target_rect is not None:
+                    self.setGeometry(self._target_rect)
+                self._apply_layout()
             self._shrink_timer.stop()
             self._drag = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
             self._press_gpos = e.globalPosition().toPoint()
@@ -488,6 +592,7 @@ class OverlayWindow(QWidget):
             scr = self._screen_at(gpos)  # 以松手点锚定屏幕,窗口尺寸突变也不漂移
             self.dock_edge = edge
             self._dock_state = "compact"
+            self._dock_anchor = gpos  # 悬停往复形变以此为基准,不逐周期漂移
             self._apply_layout()
             rect = self._dock_rect(edge, "compact", gpos, scr)
             self._animate_to(rect)
