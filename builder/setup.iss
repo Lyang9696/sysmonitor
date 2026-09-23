@@ -1,12 +1,12 @@
 [Setup]
 AppId={{6F2A9C4E-1B3D-4E8F-9C5A-SYSMONITOR10}
 AppName=系统监控
-AppVersion=1.0.3
+AppVersion=1.0.4
 AppPublisher=SysMonitor
 DefaultDirName={autopf}\SysMonitor
 DefaultGroupName=系统监控
 OutputDir=..\installer
-OutputBaseFilename=SysMonitorSetup-1.0.3
+OutputBaseFilename=SysMonitorSetup-1.0.4
 Compression=lzma2/max
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64compatible

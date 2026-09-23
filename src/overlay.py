@@ -493,9 +493,10 @@ class OverlayWindow(QWidget):
     def _clear_skip(self):
         self._skip_enter = False
 
-    def _screenshot_overlay_active(self):
-        """截图/录屏类全屏前台层是否激活:此时悬停展开会画在截图图层之外,应抑制。
-        判定:非本进程的外来窗口全屏覆盖所在屏幕(排除桌面/任务栏外壳)。"""
+    def _screenshot_overlay_active(self, topmost_only=False):
+        """截图/录屏类全屏前台层是否激活。topmost_only=True 时只认带 WS_EX_TOPMOST
+        的全屏层(截图/录屏类要盖住任务栏必为置顶);普通最大化/全屏应用永远不是
+        置顶窗口,绝不误判——否则悬浮窗会被压到浏览器/文件夹底下起不来。"""
         if not _WIN32:
             return False
         fg = _user32.GetForegroundWindow()
@@ -509,6 +510,8 @@ class OverlayWindow(QWidget):
         _user32.GetClassNameW(fg, name, 64)
         if name.value in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
             return False
+        if topmost_only and not (_user32.GetWindowLongW(fg, -20) & 0x8):  # WS_EX_TOPMOST
+            return False
         rc = wintypes.RECT()
         if not _user32.GetWindowRect(fg, ctypes.byref(rc)):
             return False
@@ -519,11 +522,12 @@ class OverlayWindow(QWidget):
                 and rc.right / dpr >= g.right() - 2 and rc.bottom / dpr >= g.bottom() - 2)
 
     def _check_capture_layer(self):
-        """截图/录屏全屏层激活时把悬浮窗压到 Z 序最底(沉到截图图层之下),
-        结束后恢复置顶——置顶悬浮窗否则会一直浮在截图编辑层上方。"""
+        """截图/录屏全屏置顶层激活时把悬浮窗压到 Z 序最底(沉到截图图层之下),
+        结束后恢复置顶。触发条件必须含 WS_EX_TOPMOST(见 _screenshot_overlay_active),
+        否则普通最大化窗口的前台状态会把悬浮窗永远压在所有软件下面。"""
         if not self.isVisible():
             return
-        if self._screenshot_overlay_active():
+        if self._screenshot_overlay_active(topmost_only=True):
             if not self._buried:
                 self._buried = True
                 _user32.SetWindowPos(int(self.winId()), _HWND_BOTTOM, 0, 0, 0, 0, _SWP_KEEP)
