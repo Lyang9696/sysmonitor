@@ -31,3 +31,14 @@ user.json
 rebuild_admin.bat
 diag_admin.bat
 diag_mem.py
+
+# PyInstaller 自动生成的 spec(打包脚本用命令行参数,不用 spec)
+*.spec
+
+# 停靠诊断产物
+dock_snap.png
+drag_error.txt
+src/config.json
+src/crash.log
+src/dock_debug.log
+src/drag_error.txt

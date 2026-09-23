@@ -99,12 +99,13 @@ class RingWidget(QWidget):
             p.end()
             return
 
-        # 上方环形区 + 下方独立标签区,避免文字压环
+        # 上方环形区 + 下方独立标签区;环在环形区内垂直居中,间隙均匀
         label_h = max(15, int(self.height() * 0.15))
-        w = min(self.width(), self.height() - label_h)
+        avail_h = self.height() - label_h
+        w = min(self.width(), avail_h)
         pen_w = max(5.0, w * 0.11)
         d = w - pen_w - 6  # 直径,给笔宽外缘留白
-        rect = QRectF((self.width() - d) / 2, pen_w / 2 + 2, d, d)
+        rect = QRectF((self.width() - d) / 2, (avail_h - d) / 2, d, d)
 
         pen = QPen(c["track"], pen_w, Qt.SolidLine, Qt.RoundCap)
         p.setPen(pen)

@@ -33,6 +33,19 @@ def _init_crash_log():
     sys.excepthook = lambda t, v, tb: traceback.print_exception(t, v, tb, file=f)
 
 
+def _log_screens():
+    """多屏/缩放环境诊断:记录全部屏幕几何,吸附错位时对照。"""
+    try:
+        from PySide6.QtGui import QGuiApplication
+        with open(CRASH_LOG, "a", encoding="utf-8", buffering=1) as f:
+            for s in QGuiApplication.screens():
+                f.write(f"[screen] {s.name()} geo={s.geometry()} avail={s.availableGeometry()} "
+                        f"dpr={s.devicePixelRatio()}\n")
+            f.write(f"[virtual] {QGuiApplication.primaryScreen().virtualGeometry()}\n")
+    except Exception:
+        pass
+
+
 def load_config():
     default = {"interval": 1, "warn": 80, "danger": 90,
                "show_overlay": True, "overlay_pos": None, "theme": "dark",
@@ -139,12 +152,13 @@ def free_memory():
 
 
 def app_icon():
-    """程序图标:优先 app_icon.png(打包资源/运行目录),回退自绘绿环。"""
+    """程序图标:优先 app_icon.png(打包资源/运行目录/assets 目录),回退自绘绿环。"""
     candidates = []
     if getattr(sys, "frozen", False):
         candidates.append(Path(getattr(sys, "_MEIPASS", "")) / "app_icon.png")
         candidates.append(Path(sys.executable).parent / "app_icon.png")
     candidates.append(Path(__file__).parent / "app_icon.png")
+    candidates.append(Path(__file__).parent.parent / "assets" / "app_icon.png")
     for c in candidates:
         if c.exists():
             return QIcon(str(c))
@@ -200,6 +214,7 @@ def tray_icon_pixmap():
 def main():
     _init_crash_log()
     app = QApplication(sys.argv)
+    _log_screens()
     app.setQuitOnLastWindowClosed(False)  # 关窗口 = 隐藏,退出走托盘
     app.setFont(QFont("Microsoft YaHei UI", 9))
     icon = app_icon()
@@ -210,15 +225,17 @@ def main():
     window = MainWindow()
     overlay = OverlayWindow()
 
+    # 恢复上次布局:先落位再吸附,apply_dock 才能按窗口所在屏幕计算吸附点
     window.load_settings(cfg)
     overlay.set_layout(cfg.get("overlay_layout", "grid2"), emit=False)
-    overlay.apply_dock(cfg.get("overlay_dock"))
     if cfg.get("overlay_pos"):
         overlay.move(*cfg["overlay_pos"])
     else:  # 默认出现在屏幕右上角
         screen = app.primaryScreen().availableGeometry()
         overlay.move(screen.right() - overlay.width() - 24, screen.top() + 80)
+    overlay.apply_dock(cfg.get("overlay_dock"))
 
+    # ---- 信号处理函数 ----
     def on_overlay_layout(mode):
         cfg["overlay_layout"] = mode
         save_config(cfg)

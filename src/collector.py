@@ -12,6 +12,7 @@ from PySide6.QtCore import QThread, Signal
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # 打包成无控制台 exe 后,子进程必须禁止弹窗
 
+# GPU 使用率读取后端:优先 N 卡官方 NVML,回退 AMD ADL,都没有则 UI 显示 --
 try:
     import pynvml
     pynvml.nvmlInit()
@@ -37,14 +38,14 @@ class Snapshot:
     gpu: float | None     # GPU 使用率 %,无 N 卡为 None
     gpu_mem: float | None  # 显存使用率 %
     mem: float            # 内存使用率 %
-    disk: float           # 系统盘容量使用率 %
+    disk: float | None    # 磁盘活跃时间 %(任务管理器口径)
     disk_write: float     # 磁盘写入 MB/s
     disk_read: float      # 磁盘读取 MB/s
     net_up: float         # 上行 KB/s
     net_down: float       # 下行 KB/s
-    temp: float | None     # CPU 温度 °C
+    temp: float | None    # CPU 温度 °C
     gpu_temp: float | None  # GPU 温度 °C
-    mem_temp: float | None  # 内存温度 °C(消费级主板无传感器,恒 None)
+    mem_temp: float | None  # 内存温度 °C(消费级主板无传感器)
     disk_temp: float | None  # 硬盘温度 °C
 
 
@@ -76,19 +77,31 @@ class Collector(QThread):
         super().__init__(parent)
         self.interval = interval
         self._running = True
-        self._lock = threading.Lock()
+
+        # 历史曲线缓冲:每个指标一份,供主窗口折线图读取
         self._history = {k: deque(maxlen=HISTORY_LEN)
                          for k in ("cpu", "gpu", "mem", "disk", "disk_write", "disk_read",
                                    "net_up", "net_down",
                                    "temp_cpu", "temp_gpu", "temp_mem", "temp_disk")}
+        self._lock = threading.Lock()
+
+        # CPU/GPU 温度源(LibreHardwareMonitor 或 ACPI),run() 内探测
         self._temp_kind = None
         self._temp_conn = None
+
+        # 硬盘温度:后台线程查询(每次新建 PowerShell 进程,耗时 0.5~2s)
         self._disk_temp = None
-        self._disk_temp_t = 0.0
+        self._disk_temp_busy = False
+        self._disk_temp_t = time.monotonic()  # 延后首次查询,避免启动即阻塞采集线程
+
+        # 差分基线:速率类指标按两次采样差值计算
         psutil.cpu_percent(interval=None)  # 预热,第一次调用无意义
         self._last_net = psutil.net_io_counters()
         self._last_disk = psutil.disk_io_counters()
         self._last_t = time.monotonic()
+
+        # 磁盘活跃时间计数器连接,run() 内创建(COM 对象不能跨线程使用)
+        self._perf_conn = None
 
     def stop(self):
         self._running = False
@@ -138,17 +151,36 @@ class Collector(QThread):
                 pass
         return None
 
+    def _disk_active(self):
+        """任务管理器口径:磁盘活跃时间% = 100 - %IdleTime,取最忙物理盘。"""
+        if self._perf_conn is None:
+            return None
+        try:
+            rows = self._perf_conn.query(
+                "SELECT Name, PercentIdleTime FROM Win32_PerfFormattedData_PerfDisk_PhysicalDisk")
+            actives = [100.0 - float(r.PercentIdleTime) for r in rows
+                       if r.Name != "_Total" and r.PercentIdleTime is not None]
+            return round(max(min(max(actives), 100.0), 0.0), 1) if actives else None
+        except Exception:
+            return None
+
     def _read_disk_temp(self, now):
-        if now - self._disk_temp_t < DISK_TEMP_PERIOD:
-            return self._disk_temp  # 节流:沿用上次值
+        if now - self._disk_temp_t < DISK_TEMP_PERIOD or self._disk_temp_busy:
+            return self._disk_temp  # 节流;查询已在后台进行时直接用缓存
         self._disk_temp_t = now
+        self._disk_temp_busy = True
+        threading.Thread(target=self._query_disk_temp, daemon=True).start()
+        return self._disk_temp
+
+    def _query_disk_temp(self):
+        # 后台线程执行:PowerShell 冷启动 0.5~2s,放采集循环里会周期性阻塞采样
         try:
             r = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
                  "Get-PhysicalDisk | ForEach-Object { "
                  "($_ | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue).Temperature } "
                  "| Where-Object { $_ } | ConvertTo-Json"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=15,
                 creationflags=CREATE_NO_WINDOW)
             vals = json.loads(r.stdout or "null")
             if isinstance(vals, (int, float)):
@@ -158,7 +190,8 @@ class Collector(QThread):
                 self._disk_temp = round(max(vals), 1)
         except Exception:
             pass  # 无权限/无传感器:保持上次值
-        return self._disk_temp
+        finally:
+            self._disk_temp_busy = False
 
     def _sample(self) -> Snapshot:
         now = time.monotonic()
@@ -199,7 +232,7 @@ class Collector(QThread):
             gpu=gpu,
             gpu_mem=gpu_mem,
             mem=psutil.virtual_memory().percent,
-            disk=psutil.disk_usage("C:\\").percent,
+            disk=self._disk_active(),
             disk_write=disk_write,
             disk_read=disk_read,
             net_up=max(0.0, net_up),
@@ -220,20 +253,37 @@ class Collector(QThread):
         return snap
 
     def run(self):
+        # COM 初始化:本线程的 WMI 查询(温度源、磁盘活跃时间)都依赖它
         try:
             import pythoncom
-            pythoncom.CoInitialize()  # 工作线程调用 WMI/COM 前必须初始化
+            pythoncom.CoInitialize()
         except Exception:
             pass
         try:
+            # 探测温度源 / 建立磁盘计数器连接(失败则对应指标显示 --)
             self._temp_kind, self._temp_conn = _probe_temp()
+            try:
+                import wmi
+                self._perf_conn = wmi.WMI(namespace="root/CIMV2")
+                self._perf_conn.query(  # 预热,formatted 计数器首查无差分
+                    "SELECT PercentIdleTime FROM Win32_PerfFormattedData_PerfDisk_PhysicalDisk")
+            except Exception:
+                pass
+
+            # 采集主循环:每拍采样并广播,失败只跳过本拍,绝不中断线程
             while self._running:
-                snap = self._sample()
-                self.snapshot_ready.emit(snap)
+                try:
+                    snap = self._sample()
+                except Exception:
+                    snap = None  # ponytail: 单次采样失败(WMI 偶发错误等)跳过本拍,不杀采集线程
+                if snap is not None:
+                    self.snapshot_ready.emit(snap)
                 end = time.monotonic() + self.interval
                 while self._running and time.monotonic() < end:
                     time.sleep(min(0.1, end - time.monotonic()))
         finally:
+            self._perf_conn = None
+            self._temp_conn = None
             try:
                 import pythoncom
                 pythoncom.CoUninitialize()

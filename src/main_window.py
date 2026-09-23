@@ -1,8 +1,7 @@
 """主窗口:大圆环 + 折线历史 + 设置。关闭时隐藏到托盘。"""
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QGridLayout, QGroupBox,
-                               QHBoxLayout, QLabel, QMainWindow, QSpinBox,
-                               QVBoxLayout, QWidget)
+                               QHBoxLayout, QLabel, QMainWindow, QSpinBox, QVBoxLayout, QWidget)
 
 from collector import HAS_GPU
 from widgets import GaugeBox, level_color
