@@ -13,6 +13,7 @@ from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
+from autorun import is_autorun, set_autorun
 from collector import Collector
 from main_window import MainWindow
 from overlay import OverlayWindow
@@ -245,11 +246,13 @@ def main():
         window.update_snapshot(snap)
         window.update_history(collector)
         # 悬浮窗保活:被"显示桌面"隐藏后自动恢复;停靠在任务栏上时,
-        # 点击任务栏会被 Explorer 提到悬浮窗之前,每秒提升一次层级压回去
+        # 点击任务栏会被 Explorer 提到悬浮窗之前,每秒提升一次层级压回去。
+        # 右键菜单打开期间除外:raise_ 会把同置顶组的弹出菜单压回 UI 之下
         if cfg.get("show_overlay", True):
             if not overlay.isVisible():
                 overlay.show()
-            overlay.raise_()
+            if not overlay._menu_open:
+                overlay.raise_()
 
     def apply_settings(new_cfg):
         cfg.update(new_cfg)
@@ -295,6 +298,10 @@ def main():
     apply_settings(cfg)  # 初始应用一次
 
     # 托盘
+    act_auto = QAction("开机自启")
+    act_auto.setCheckable(True)
+    act_auto.setChecked(is_autorun())
+    act_auto.toggled.connect(set_autorun)
     tray = QSystemTrayIcon(icon)
     menu = QMenu()
     act_show = QAction("打开主窗口")
@@ -302,6 +309,7 @@ def main():
     act_quit = QAction("退出")
     act_quit.triggered.connect(quit_all)
     menu.addAction(act_show)
+    menu.addAction(act_auto)
     menu.addSeparator()
     menu.addAction(act_quit)
     tray.setContextMenu(menu)

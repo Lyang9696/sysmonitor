@@ -1,4 +1,5 @@
 """后台采集线程:CPU / GPU / 内存 / 磁盘 / 网络 / 温度,1 秒一拍。"""
+import ctypes
 import json
 import os
 import subprocess
@@ -12,7 +13,8 @@ from PySide6.QtCore import QThread, Signal
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # 打包成无控制台 exe 后,子进程必须禁止弹窗
 
-# GPU 使用率读取后端:优先 N 卡官方 NVML,回退 AMD ADL,都没有则 UI 显示 --
+# GPU 使用率读取后端:优先 N 卡官方 NVML,再 AMD ADL,最后 Windows GPU Engine
+# 性能计数器(任务管理器同源,厂商无关,Intel/AMD/N 卡通用)兜底
 try:
     import pynvml
     pynvml.nvmlInit()
@@ -26,6 +28,140 @@ except Exception:
     except Exception:
         GPU_BACKEND = None
 HAS_GPU = GPU_BACKEND is not None
+
+_GPU_NAME = None  # 显卡型号(过滤虚拟显卡),gpu_name() 惰性探测并缓存
+
+
+def gpu_name():
+    """真实显卡型号(跳过远程虚拟显卡/基本渲染驱动),如 'AMD Radeon RX 6600'。"""
+    global _GPU_NAME
+    if _GPU_NAME is None:
+        try:
+            import wmi
+            rows = wmi.WMI(namespace="root/CIMV2").query(
+                "SELECT Name FROM Win32_VideoController")
+            skip = ("virtual", "idd", "basic", "mirror")
+            names = [r.Name for r in rows
+                     if r.Name and not any(s in r.Name.lower() for s in skip)]
+            name = names[0] if names else ""
+            for junk in ("(R)", "(TM)", "(C)", "Graphics"):
+                name = name.replace(junk, "")
+            _GPU_NAME = " ".join(name.split())
+        except Exception:
+            _GPU_NAME = ""
+    return _GPU_NAME
+
+
+class _PdhFmtUnion(ctypes.Union):
+    _fields_ = [("longValue", ctypes.c_long), ("largeValue", ctypes.c_longlong),
+                ("doubleValue", ctypes.c_double)]
+
+
+class _PdhFmtValue(ctypes.Structure):
+    """PDH_FMT_COUNTERVALUE:CStatus + 联合体,共 16 字节(double 在偏移 8)。
+    传 c_double 指针当输出缓冲会读到 CStatus 的位模式——表现为永远 0.0。"""
+    _fields_ = [("CStatus", ctypes.c_uint), ("u", _PdhFmtUnion)]
+
+
+class _GpuEngineCounter:
+    """GPU Engine 性能计数器(任务管理器同源,厂商无关,Intel/AMD/N 卡通用)。
+    走 PDH 原生接口(WMI 同名查询实测 11s 不可用)。该提供程序只注册英文名
+    (本地化表 0804 无条目),直接用英文物件名枚举实例、逐条添加具体路径;
+    实例随进程增减,每 60 拍重建一次。"""
+
+    REBUILD_EVERY = 60
+    _PDH_FMT_DOUBLE = 0x200
+
+    def __init__(self):
+        if os.name != "nt":
+            raise OSError("windows only")
+        self._pdh = ctypes.WinDLL("pdh")
+        self._pdh.PdhOpenQueryW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p,
+                                            ctypes.POINTER(ctypes.c_void_p)]
+        self._pdh.PdhAddCounterW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                             ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        self._pdh.PdhRemoveCounter.argtypes = [ctypes.c_void_p]
+        self._pdh.PdhCollectQueryData.argtypes = [ctypes.c_void_p]
+        self._pdh.PdhGetFormattedCounterValue.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(_PdhFmtValue)]
+        self._pdh.PdhEnumObjectItemsW.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+            ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_uint, ctypes.c_uint]
+        self._q = ctypes.c_void_p()
+        if self._pdh.PdhOpenQueryW(None, None, ctypes.byref(self._q)) != 0:
+            raise OSError("PdhOpenQueryW")
+        self._counters = []  # (计数器句柄, 引擎类型)
+        self._n = 0
+        if not self._rebuild():
+            raise OSError("GPU Engine 计数器枚举失败")
+
+    def _rebuild(self):
+        """枚举全部实例逐条添加。路径 \\GPU Engine(<实例>)\\Utilization Percentage:
+        对象名与实例括号之间没有分隔符,曾因多拼一个反斜杠整批失败。"""
+        BS, NULL = chr(92), chr(0)
+        cc, ic = ctypes.c_uint32(0), ctypes.c_uint32(0)
+        try:
+            # 第一次调用返回 PDH_MORE_DATA(0x800007D2)是预期行为:只为拿缓冲区大小
+            self._pdh.PdhEnumObjectItemsW(
+                None, None, "GPU Engine", None, ctypes.byref(cc),
+                None, ctypes.byref(ic), 400, 0)
+            cbuf = ctypes.create_unicode_buffer(cc.value)
+            ibuf = ctypes.create_unicode_buffer(ic.value)
+            if self._pdh.PdhEnumObjectItemsW(
+                    None, None, "GPU Engine", cbuf, ctypes.byref(cc),
+                    ibuf, ctypes.byref(ic), 400, 0) != 0:
+                return False
+            counters = [c for c in ctypes.wstring_at(cbuf, cc.value).split(NULL) if c]
+            instances = [i for i in ctypes.wstring_at(ibuf, ic.value).split(NULL)
+                         if i and "engtype" in i]
+            ctr = next(c for c in counters
+                       if c.replace(" ", "").lower() == "utilizationpercentage")
+        except Exception:
+            return False
+        for h, _ in self._counters:
+            self._pdh.PdhRemoveCounter(h)
+        self._counters = []
+        pairs = []
+        for inst in instances:
+            h = ctypes.c_void_p()
+            p = BS + "GPU Engine(" + inst + ")" + BS + ctr
+            if self._pdh.PdhAddCounterW(self._q, p, None, ctypes.byref(h)) == 0:
+                pairs.append((h, inst.rsplit("engtype_", 1)[-1]))
+        if not pairs:
+            return False
+        self._counters = pairs
+        self._n = 0
+        self._collect()  # 基线采样:利用率是速率型计数器,需两次采样才有差分
+        return True
+
+    def _collect(self):
+        ret = self._pdh.PdhCollectQueryData(self._q)
+        if ret != 0:
+            raise OSError(f"PdhCollectQueryData {ret}")
+
+    def usage(self):
+        """本帧 GPU 总占用 %(各引擎类型聚合求和后取最大),失败返回 None。"""
+        try:
+            self._collect()
+            agg = {}
+            for h, eng in self._counters:
+                f = _PdhFmtValue()
+                if (self._pdh.PdhGetFormattedCounterValue(
+                        h, self._PDH_FMT_DOUBLE, None, ctypes.byref(f)) == 0
+                        and f.CStatus == 0):
+                    agg[eng] = agg.get(eng, 0.0) + f.u.doubleValue
+            self._n += 1
+            if len(agg) < max(1, len(self._counters) // 2) or self._n >= self.REBUILD_EVERY:
+                self._rebuild()  # 大半实例失效(进程批量退出)或到期:重建
+            return round(min(100.0, max(agg.values())), 1) if agg else None
+        except Exception:
+            return None
+
+
+_ENGINE = None
+_ENGINE_DEAD = False
 
 HISTORY_LEN = 300  # 5 分钟 @ 1s
 DISK_TEMP_PERIOD = 5.0  # 硬盘温度采样周期(PowerShell 子进程较贵,SSD 温度变化慢)
@@ -146,7 +282,9 @@ class Collector(QThread):
                 pass
         elif GPU_BACKEND == "amd":
             try:
-                return float(_AMD_DEVICES[0].getCurrentTemperature())
+                t = float(_AMD_DEVICES[0].getCurrentTemperature())
+                if t > 0:  # 老接口对 RDNA2 可能返回 0,视为无效
+                    return round(t, 1)
             except Exception:
                 pass
         return None
@@ -193,6 +331,19 @@ class Collector(QThread):
         finally:
             self._disk_temp_busy = False
 
+    def _engine_usage(self):
+        """GPU Engine 计数器兜底(惰性创建,PDH 操作须固定在采集线程)。"""
+        global _ENGINE, _ENGINE_DEAD
+        if _ENGINE_DEAD:
+            return None
+        if _ENGINE is None:
+            try:
+                _ENGINE = _GpuEngineCounter()
+            except Exception:
+                _ENGINE_DEAD = True
+                return None
+        return _ENGINE.usage()
+
     def _sample(self) -> Snapshot:
         now = time.monotonic()
         dt = max(now - self._last_t, 1e-6)
@@ -217,14 +368,21 @@ class Collector(QThread):
             except Exception:
                 gpu = gpu_mem = None
         elif GPU_BACKEND == "amd":
+            # 占用优先用任务管理器同源的系统计数器:pyadl 的 Overdrive 老接口
+            # 在 RDNA2(RX 6000 系)上会静默返回 0 而不抛错,不能作准
+            gpu = self._engine_usage()
+            if gpu is None:
+                try:
+                    gpu = float(_AMD_DEVICES[0].getCurrentUsage())
+                except Exception:
+                    gpu = None
             try:
-                gpu = float(_AMD_DEVICES[0].getCurrentUsage())
+                mem = float(_AMD_DEVICES[0].getCurrentMemoryUsage())
+                gpu_mem = mem if mem > 0 else None
             except Exception:
                 pass
-            try:
-                gpu_mem = float(_AMD_DEVICES[0].getCurrentMemoryUsage())
-            except Exception:
-                pass
+        else:
+            gpu = self._engine_usage()  # 无厂商后端(Intel 核显/未装驱动):计数器兜底
 
         snap = Snapshot(
             ts=time.time(),

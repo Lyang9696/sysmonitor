@@ -3,7 +3,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QGridLayout, QGroupBox,
                                QHBoxLayout, QLabel, QMainWindow, QSpinBox, QVBoxLayout, QWidget)
 
-from collector import HAS_GPU
+from collector import HAS_GPU, gpu_name
 from widgets import GaugeBox, level_color
 
 
@@ -154,8 +154,11 @@ class MainWindow(QMainWindow):
             self.boxes["gpu"].ring.set_sub(f"显存 {snap.gpu_mem:.0f}%")
 
         hints = []
-        if not HAS_GPU:
-            hints.append("未检测到 GPU")
+        name = gpu_name()
+        if name:
+            hints.append(f"显卡: {name}")
+        if snap.gpu is None:
+            hints.append("GPU 占用不可读" if HAS_GPU else "未检测到可采集 GPU")
         if temp_mode and snap.temp is None:
             hints.append("未检测到温度传感器,以管理员身份运行可启用")
         elif temp_mode and snap.mem_temp is None:

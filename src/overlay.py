@@ -99,6 +99,7 @@ class OverlayWindow(QWidget):
         self._dock_state = None   # 停靠形态:None(自由) / "full"(贴边完整) / "compact"(收缩小环)
         self._dock_anchor = None  # 停靠锚点:full/compact 往复形变共用,防逐周期漂移
         self.temp_mode = False    # 温度显示模式:环显示温度而非百分比
+        self._menu_open = False   # 右键菜单打开中:禁用离开自动收缩(菜单会抢走鼠标)
 
         # ---- 拖动 ----
         self._drag = None         # 光标相对窗口左上角的偏移,拖动期间非 None
@@ -590,13 +591,14 @@ class OverlayWindow(QWidget):
 
     def leaveEvent(self, _):
         self._enter_timer.stop()  # 离开即取消未定的展开
-        # 展开态鼠标离开 → 延时收起
-        if self.dock_edge and self._dock_state == "full" and not self._dragging:
+        # 展开态鼠标离开 → 延时收起(右键菜单打开期间除外:菜单弹出会触发本事件)
+        if (self.dock_edge and self._dock_state == "full"
+                and not self._dragging and not self._menu_open):
             self._shrink_timer.start()
 
     def _auto_shrink(self):
-        if self._dragging or self.underMouse():
-            return  # 拖动中/鼠标仍在窗口上:保持完整
+        if self._dragging or self._menu_open or self.underMouse():
+            return  # 拖动中/菜单开着/鼠标仍在窗口上:保持完整
         if self.dock_edge and self._dock_state == "full":
             self._morph_to("compact")
 
@@ -710,6 +712,7 @@ class OverlayWindow(QWidget):
         self.open_main.emit()
 
     def contextMenuEvent(self, e):
+        self._shrink_timer.stop()  # 菜单打开期间不收缩(_auto_shrink 亦有 _menu_open 防线)
         menu = QMenu(self)
         # 悬浮窗本身置顶,弹出菜单不显式置顶的话会被盖在窗口下面
         menu.setWindowFlags(menu.windowFlags() | Qt.WindowStaysOnTopHint)
@@ -723,7 +726,12 @@ class OverlayWindow(QWidget):
         menu.addSeparator()
         menu.addAction("释放内存", self.release_memory.emit)
         menu.addAction("退出", self.quit_app.emit)
+        self._menu_open = True
         menu.exec(e.globalPos())
+        self._menu_open = False
+        # 菜单关掉后鼠标若已不在窗口上,恢复正常收缩节奏
+        if self.dock_edge and self._dock_state == "full" and not self.underMouse():
+            self._shrink_timer.start()
 
     # ---- 数据 ----
     def apply_settings(self, warn, danger):
